@@ -27,9 +27,18 @@ except Exception as e:
     print("[ERROR] Tesseract error:", e)
     print("   Make sure Tesseract OCR is installed!")
 
-# Test ultralytics
+# Test YOLO OpenCV DNN loading
 try:
-    from ultralytics import YOLO
-    print("[OK] Ultralytics imported successfully")
+    from app import YOLOOpenCVDNN, download_model_if_needed
+    print("[OK] YOLOOpenCVDNN class imported from app.py successfully")
+    
+    # Try checking/downloading yolov8n.onnx for test verification
+    print("[INFO] Checking for yolov8n.onnx model...")
+    onnx_path = download_model_if_needed("yolov8n.pt")
+    
+    # Instantiate the model
+    print(f"[INFO] Initializing YOLOOpenCVDNN model with {onnx_path}...")
+    model = YOLOOpenCVDNN(onnx_path)
+    print("[OK] YOLOOpenCVDNN model initialized successfully!")
 except Exception as e:
-    print("[ERROR] Ultralytics error:", e)
+    print("[ERROR] YOLO OpenCV DNN test failed:", e)

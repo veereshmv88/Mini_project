@@ -79,6 +79,7 @@ venv.bak/
 # Custom local artifacts
 test_capture.jpg
 *.pt
+*.onnx
 *.log
 .system_generated/
 *.tmp

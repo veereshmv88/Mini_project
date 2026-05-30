@@ -5,8 +5,8 @@ import platform
 import time
 import threading
 import queue
-from ultralytics import YOLO
-from collections import deque
+import numpy as np
+import urllib.request
 import speech_recognition as sr
 import os
 from dotenv import load_dotenv
@@ -18,11 +18,132 @@ import PIL.Image
 load_dotenv()
 
 # -------------------------------
+# COCO dataset classes (80 objects)
+# -------------------------------
+coco_80_classes = [
+    "person", "bicycle", "car", "motorbike", "aeroplane", "bus", "train", "truck", 
+    "boat", "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", 
+    "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", 
+    "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee", 
+    "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", 
+    "skateboard", "surfboard", "tennis racket", "bottle", "wine glass", "cup", 
+    "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange", 
+    "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "sofa", 
+    "pottedplant", "bed", "diningtable", "toilet", "tvmonitor", "laptop", "mouse", 
+    "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink", 
+    "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", 
+    "hair drier", "toothbrush"
+]
+
+# -------------------------------
+# Helper classes to mimic YOLOv8 results structure
+# -------------------------------
+class BoxMock:
+    def __init__(self, cls, label, xyxy, conf):
+        self.cls = [cls]
+        self.xyxy = [xyxy]
+        self.conf = conf
+
+class ResultMock:
+    def __init__(self, boxes):
+        self.boxes = boxes
+
+class YOLOOpenCVDNN:
+    def __init__(self, model_path, conf_threshold=0.20):
+        self.net = cv2.dnn.readNetFromONNX(model_path)
+        self.conf_threshold = conf_threshold
+        self.names = coco_80_classes
+
+    def __call__(self, frame, conf=None):
+        conf_thresh = conf if conf is not None else self.conf_threshold
+        h_frame, w_frame = frame.shape[:2]
+        
+        # YOLOv8 input size is 640x640
+        blob = cv2.dnn.blobFromImage(frame, 1/255.0, (640, 640), swapRB=True, crop=False)
+        self.net.setInput(blob)
+        outputs = self.net.forward()
+        
+        # Output format is (1, 84, 8400). Transpose to (8400, 84)
+        predictions = np.squeeze(outputs).T
+        
+        # Extract confidences and class IDs
+        scores = np.max(predictions[:, 4:], axis=1)
+        class_ids_arr = np.argmax(predictions[:, 4:], axis=1)
+        
+        # Filter by confidence
+        mask = scores > conf_thresh
+        filtered_preds = predictions[mask]
+        filtered_scores = scores[mask]
+        filtered_class_ids = class_ids_arr[mask]
+        
+        x_factor = w_frame / 640.0
+        y_factor = h_frame / 640.0
+        
+        nms_boxes = []
+        nms_confidences = []
+        nms_class_ids = []
+        
+        for pred, score, class_id in zip(filtered_preds, filtered_scores, filtered_class_ids):
+            x_center, y_center, width, height = pred[:4]
+            
+            left = int((x_center - 0.5 * width) * x_factor)
+            top = int((y_center - 0.5 * height) * y_factor)
+            w = int(width * x_factor)
+            h = int(height * y_factor)
+            
+            left = max(0, left)
+            top = max(0, top)
+            w = min(w, w_frame - left)
+            h = min(h, h_frame - top)
+            
+            nms_boxes.append([left, top, w, h])
+            nms_confidences.append(float(score))
+            nms_class_ids.append(int(class_id))
+            
+        indices = cv2.dnn.NMSBoxes(nms_boxes, nms_confidences, conf_thresh, 0.45)
+        
+        boxes_list = []
+        if len(indices) > 0:
+            if hasattr(indices, 'flatten'):
+                idx_iter = indices.flatten()
+            else:
+                idx_iter = [i[0] if isinstance(i, (list, np.ndarray)) else i for i in indices]
+                
+            for i in idx_iter:
+                left, top, w, h = nms_boxes[i]
+                x1 = left
+                y1 = top
+                x2 = left + w
+                y2 = top + h
+                
+                cls = nms_class_ids[i]
+                label = self.names[cls]
+                conf_val = nms_confidences[i]
+                
+                boxes_list.append(BoxMock(cls, label, [x1, y1, x2, y2], conf_val))
+                
+        return [ResultMock(boxes_list)]
+
+def download_model_if_needed(model_name):
+    # Convert .pt to .onnx extension
+    onnx_name = model_name.replace(".pt", ".onnx")
+    if not os.path.exists(onnx_name):
+        print(f"[INFO] ONNX model {onnx_name} not found. Downloading from Hugging Face...")
+        url = f"https://huggingface.co/Kalray/yolov8/resolve/main/{onnx_name}"
+        try:
+            urllib.request.urlretrieve(url, onnx_name)
+            print(f"[OK] Downloaded {onnx_name} successfully.")
+        except Exception as e:
+            print(f"[ERROR] Failed to download {onnx_name} from Hugging Face: {e}")
+            raise e
+    return onnx_name
+
+# -------------------------------
 # Configuration Settings
 # -------------------------------
 # Swap model to "yolov8s.pt" (Small) or "yolov8m.pt" (Medium) for better accuracy.
 # "yolov8n.pt" (Nano) is faster but less accurate.
-YOLO_MODEL_NAME = "yolov8s.pt"  
+YOLO_MODEL_NAME = "yolov8n.pt"  
 YOLO_CONF_THRESHOLD = 0.20       # Lower threshold (default is 0.25) to detect more objects
 
 # Configure pytesseract path for Windows
@@ -188,9 +309,20 @@ def get_distance(timeout=0.05):
         return None
 
 # -------------------------------
-# Load YOLO Model
-# -------------------------------
-model = YOLO(YOLO_MODEL_NAME)
+# Convert pt filename to onnx, and download if needed
+try:
+    yolo_onnx_path = download_model_if_needed(YOLO_MODEL_NAME)
+    model = YOLOOpenCVDNN(yolo_onnx_path, conf_threshold=YOLO_CONF_THRESHOLD)
+except Exception as e:
+    print(f"[FATAL] Failed to initialize YOLO OpenCV DNN model: {e}")
+    # Fallback placeholder to prevent code crashing if offline
+    class YOLOFallback:
+        def __init__(self):
+            self.names = coco_80_classes
+        def __call__(self, frame, conf=None):
+            return [ResultMock([])]
+    model = YOLOFallback()
+
 
 # -------------------------------
 # Camera Setup & Reconnection
@@ -427,271 +559,272 @@ def conversation_worker():
             
     print("[INFO] Conversation loop terminated.")
 
-speak("AI Blind Assistant started")
-# -------------------------------
-# Main Loop
-# -------------------------------
-frame_count = 0
-DETECTION_EVERY_N_FRAMES = 5     # run YOLO only every N frames
-OCR_EVERY_N_FRAMES = 30          # run OCR only every N frames
-RECONNECT_COOLDOWN = 100         # frames before checking for camera reconnection again
+if __name__ == "__main__":
+    speak("AI Blind Assistant started")
+    # -------------------------------
+    # Main Loop
+    # -------------------------------
+    frame_count = 0
+    DETECTION_EVERY_N_FRAMES = 5     # run YOLO only every N frames
+    OCR_EVERY_N_FRAMES = 30          # run OCR only every N frames
+    RECONNECT_COOLDOWN = 100         # frames before checking for camera reconnection again
 
-try:
-    while True:
-        frame_count += 1
-        current_time = time.time()
-        frame = None
+    try:
+        while True:
+            frame_count += 1
+            current_time = time.time()
+            frame = None
 
-        # Try to read from camera if available
-        if cap is not None:
-            try:
-                ret, temp_frame = cap.read()
-                if ret:
-                    frame = temp_frame
-                    camera_alert_spoken = False
-                else:
-                    raise Exception("Failed to read frame")
-            except Exception:
-                print("Camera link lost, releasing capture device.")
-                cap.release()
-                cap = None
-
-        # Camera reconnection logic if offline
-        if cap is None:
-            if not camera_alert_spoken:
-                speak("Camera connection lost")
-                camera_alert_spoken = True
-            
-            # Periodically attempt to reconnect
-            if frame_count % RECONNECT_COOLDOWN == 0:
-                print("Attempting to reconnect camera...")
-                cap = initialize_camera()
-
-        # If camera is down, display a placeholder to keep UI active
-        camera_online = frame is not None
-        if not camera_online:
-            frame = get_placeholder_frame()
-
-        # Save the raw camera frame thread-safely for the Multimodal AI
-        with camera_frame_lock:
-            latest_camera_frame = frame.copy() if camera_online else None
-
-        # ---- Object Detection (throttled) ----
-        # Throttle YOLO significantly during conversation to free up CPU for speech recognition
-        current_yolo_throttle = 35 if is_conversing else DETECTION_EVERY_N_FRAMES
-        if camera_online and (frame_count % current_yolo_throttle == 0):
-            try:
-                results = model(frame, conf=YOLO_CONF_THRESHOLD)
-                detected_objects = set()
-                new_detected_list = []
-
-                for result in results:
-                    for box in result.boxes:
-                        cls = int(box.cls[0])
-                        label = model.names[cls]
-                        detected_objects.add(label)
-
-                        # Draw bounding box (optional, for debugging)
-                        x1, y1, x2, y2 = map(int, box.xyxy[0])
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                        cv2.putText(frame, label, (x1, y1 - 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-
-                        # Calculate position and area ratio
-                        w_frame = frame.shape[1]
-                        h_frame = frame.shape[0]
-                        x_center = (x1 + x2) / 2
-                        area_ratio = ((x2 - x1) * (y2 - y1)) / (w_frame * h_frame)
-
-                        if x_center < w_frame * 0.35:
-                            position = "left"
-                        elif x_center > w_frame * 0.65:
-                            position = "right"
-                        else:
-                            position = "center"
-
-                        if label == "person":
-                            last_person_seen_time = time.time()
-                            # Detect a person relatively close in frame (area_ratio > 0.02)
-                            if area_ratio > 0.02:
-                                with conversation_active_lock:
-                                    if not is_conversing:
-                                        is_conversing = True
-                                        speak("Hello! I see you. How can I help you today?")
-                                        threading.Thread(target=conversation_worker, daemon=True).start()
-
-                        new_detected_list.append({
-                            'label': label,
-                            'position': position,
-                            'area_ratio': area_ratio
-                        })
-
-                # Update the tracking list
-                current_detected_objects = new_detected_list
-
-                # 1. Immediate announcement for new objects entering the view
-                if not is_conversing:
-                    new_objects = detected_objects - last_spoken_objects
-                    if new_objects:
-                        speak("I see " + ", ".join(new_objects))
-                        # Update last_spoken_objects to include them
-                        last_spoken_objects.update(new_objects)
-                        last_object_speak_time = current_time
-
-                # 2. Periodic description of everything in view (full scene description)
-                if not is_conversing:
-                    if detected_objects:
-                        # If we haven't spoken the full list in FULL_SCENE_INTERVAL seconds, do so
-                        if current_time - last_full_scene_speak_time > FULL_SCENE_INTERVAL:
-                            speak("In front of you: " + ", ".join(detected_objects))
-                            last_full_scene_speak_time = current_time
-                            # Sync last_spoken_objects with all currently visible objects
-                            last_spoken_objects = detected_objects.copy()
-                    else:
-                        # If nothing is in view, and we recently had objects, clean up
-                        last_spoken_objects = set()
-            except Exception as e:
-                print(f"Error running YOLO: {e}")
-
-        # ---- Distance Measurement & Spatial Navigation ----
-        distance = get_distance()
-        if distance is not None:
-            cv2.putText(frame, f"Distance: {distance} cm", (20, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-            last_distance = distance
-        else:
-            cv2.putText(frame, "Distance: out of range", (20, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-
-        # Trigger conversation via distance sensor if camera is offline and distance is close
-        if not camera_online and distance is not None and distance < 100:
-            last_person_seen_time = time.time()
-            with conversation_active_lock:
-                if not is_conversing:
-                    is_conversing = True
-                    speak("Hello! I notice you are near. How can I help you today?")
-                    threading.Thread(target=conversation_worker, daemon=True).start()
-
-        # Evaluate obstacles from sensor and camera
-        sensor_obstacle_detected = (distance is not None and distance < OBSTACLE_DIST_THRESH)
-        
-        # Camera obstacle: any object in front that is large/close
-        # e.g., center object with area_ratio > 0.08, or side objects with area_ratio > 0.15
-        camera_obstacles = [
-            obj for obj in current_detected_objects 
-            if (obj['position'] == 'center' and obj['area_ratio'] > 0.08) or 
-               (obj['position'] != 'center' and obj['area_ratio'] > 0.15)
-        ]
-        camera_obstacles.sort(key=lambda x: x['area_ratio'], reverse=True)
-        camera_obstacle_detected = len(camera_obstacles) > 0
-
-        # Trigger navigation guidance if either sensor or camera detects an obstacle
-        if sensor_obstacle_detected or camera_obstacle_detected:
-            # Determine instruction
-            # Prioritize yolo obstacles for specific naming
-            yolo_obstacles = [obj for obj in current_detected_objects if obj['area_ratio'] > 0.005]
-            yolo_obstacles.sort(key=lambda x: x['area_ratio'], reverse=True)
-
-            if yolo_obstacles:
-                primary_obstacle = yolo_obstacles[0]
-                label = primary_obstacle['label']
-                pos = primary_obstacle['position']
-
-                if pos == "center":
-                    if distance is not None and distance < 30:
-                        instruction = f"{label} right ahead. Go back."
-                    else:
-                        left_clear = not any(obj['position'] == 'left' for obj in yolo_obstacles)
-                        right_clear = not any(obj['position'] == 'right' for obj in yolo_obstacles)
-                        if left_clear:
-                            instruction = f"{label} in front. Go left."
-                        elif right_clear:
-                            instruction = f"{label} in front. Go right."
-                        else:
-                            instruction = f"{label} in front. Go back."
-                elif pos == "left":
-                    instruction = f"{label} on your left. Go right."
-                else:  # right
-                    instruction = f"{label} on your right. Go left."
-            else:
-                # Fallback if no YOLO objects are detected, but sensor triggered
-                if distance is not None and distance < 30:
-                    instruction = f"Obstacle close, {distance} centimeters. Go back."
-                else:
-                    dist_str = f"{distance} centimeters" if distance is not None else "ahead"
-                    instruction = f"Obstacle {dist_str}. Go left."
-
-            # Evaluate whether to speak
-            is_new_instruction = (instruction != last_nav_instruction)
-            time_elapsed = current_time - last_nav_time
-
-            # If we are conversing, suppress regular navigation instruction unless it's a critical close obstacle
-            should_speak_nav = True
-            if is_conversing:
-                is_critical = (distance is not None and distance < 35)
-                if not is_critical:
-                    should_speak_nav = False
-
-            if should_speak_nav:
-                if is_new_instruction or (time_elapsed > NAV_INTERVAL):
-                    speak(instruction)
-                    last_nav_instruction = instruction
-                    last_nav_time = current_time
-                    last_obstacle_alert = True
-                
-                # If distance changed significantly while still close (sensor-based)
-                elif (not is_new_instruction and distance is not None and last_distance is not None 
-                      and abs(distance - last_distance) > DIST_CHANGE_THRESH):
-                    speak(f"Distance now {distance} centimeters")
-        else:
-            # Reset alert when path becomes clear (no sensor obstacle and no camera obstacle)
-            if last_obstacle_alert:
-                if not is_conversing:
-                    speak("Path is clear")
-                last_nav_instruction = ""
-            last_obstacle_alert = False
-
-        # ---- OCR Text Reading (throttled & filtered) ----
-        # Disable OCR processing while conversing to save CPU
-        if not is_conversing and camera_online and (frame_count % OCR_EVERY_N_FRAMES == 0):
-            try:
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                # Use Tesseract with confidence data if possible
+            # Try to read from camera if available
+            if cap is not None:
                 try:
-                    data = pytesseract.image_to_data(gray, output_type=pytesseract.Output.DICT)
-                    # Concatenate only words with high confidence
-                    words = [word for word, conf in zip(data['text'], data['conf']) 
-                             if conf > OCR_CONFIDENCE]
-                    text = ' '.join(words).strip()
+                    ret, temp_frame = cap.read()
+                    if ret:
+                        frame = temp_frame
+                        camera_alert_spoken = False
+                    else:
+                        raise Exception("Failed to read frame")
                 except Exception:
-                    # Fallback if confidence data not available
-                    text = pytesseract.image_to_string(gray).strip()
+                    print("Camera link lost, releasing capture device.")
+                    cap.release()
+                    cap = None
 
-                if len(text) > OCR_MIN_LENGTH and text != ocr_last_text:
+            # Camera reconnection logic if offline
+            if cap is None:
+                if not camera_alert_spoken:
+                    speak("Camera connection lost")
+                    camera_alert_spoken = True
+                
+                # Periodically attempt to reconnect
+                if frame_count % RECONNECT_COOLDOWN == 0:
+                    print("Attempting to reconnect camera...")
+                    cap = initialize_camera()
+
+            # If camera is down, display a placeholder to keep UI active
+            camera_online = frame is not None
+            if not camera_online:
+                frame = get_placeholder_frame()
+
+            # Save the raw camera frame thread-safely for the Multimodal AI
+            with camera_frame_lock:
+                latest_camera_frame = frame.copy() if camera_online else None
+
+            # ---- Object Detection (throttled) ----
+            # Throttle YOLO significantly during conversation to free up CPU for speech recognition
+            current_yolo_throttle = 35 if is_conversing else DETECTION_EVERY_N_FRAMES
+            if camera_online and (frame_count % current_yolo_throttle == 0):
+                try:
+                    results = model(frame, conf=YOLO_CONF_THRESHOLD)
+                    detected_objects = set()
+                    new_detected_list = []
+
+                    for result in results:
+                        for box in result.boxes:
+                            cls = int(box.cls[0])
+                            label = model.names[cls]
+                            detected_objects.add(label)
+
+                            # Draw bounding box (optional, for debugging)
+                            x1, y1, x2, y2 = map(int, box.xyxy[0])
+                            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                            cv2.putText(frame, label, (x1, y1 - 10),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+                            # Calculate position and area ratio
+                            w_frame = frame.shape[1]
+                            h_frame = frame.shape[0]
+                            x_center = (x1 + x2) / 2
+                            area_ratio = ((x2 - x1) * (y2 - y1)) / (w_frame * h_frame)
+
+                            if x_center < w_frame * 0.35:
+                                position = "left"
+                            elif x_center > w_frame * 0.65:
+                                position = "right"
+                            else:
+                                position = "center"
+
+                            if label == "person":
+                                last_person_seen_time = time.time()
+                                # Detect a person relatively close in frame (area_ratio > 0.02)
+                                if area_ratio > 0.02:
+                                    with conversation_active_lock:
+                                        if not is_conversing:
+                                            is_conversing = True
+                                            speak("Hello! I see you. How can I help you today?")
+                                            threading.Thread(target=conversation_worker, daemon=True).start()
+
+                            new_detected_list.append({
+                                'label': label,
+                                'position': position,
+                                'area_ratio': area_ratio
+                            })
+
+                    # Update the tracking list
+                    current_detected_objects = new_detected_list
+
+                    # 1. Immediate announcement for new objects entering the view
                     if not is_conversing:
-                        speak("Text reads: " + text)
-                        ocr_last_text = text
-            except Exception as e:
-                print(f"Error running OCR: {e}")
+                        new_objects = detected_objects - last_spoken_objects
+                        if new_objects:
+                            speak("I see " + ", ".join(new_objects))
+                            # Update last_spoken_objects to include them
+                            last_spoken_objects.update(new_objects)
+                            last_object_speak_time = current_time
 
-        # ---- Show preview (optional) ----
-        cv2.imshow("AI Blind Assistant", frame)
+                    # 2. Periodic description of everything in view (full scene description)
+                    if not is_conversing:
+                        if detected_objects:
+                            # If we haven't spoken the full list in FULL_SCENE_INTERVAL seconds, do so
+                            if current_time - last_full_scene_speak_time > FULL_SCENE_INTERVAL:
+                                speak("In front of you: " + ", ".join(detected_objects))
+                                last_full_scene_speak_time = current_time
+                                # Sync last_spoken_objects with all currently visible objects
+                                last_spoken_objects = detected_objects.copy()
+                        else:
+                            # If nothing is in view, and we recently had objects, clean up
+                            last_spoken_objects = set()
+                except Exception as e:
+                    print(f"Error running YOLO: {e}")
 
-        # Yield CPU control during conversation to prioritize SpeechRecognition
-        if is_conversing:
-            time.sleep(0.05)
+            # ---- Distance Measurement & Spatial Navigation ----
+            distance = get_distance()
+            if distance is not None:
+                cv2.putText(frame, f"Distance: {distance} cm", (20, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                last_distance = distance
+            else:
+                cv2.putText(frame, "Distance: out of range", (20, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
-        # Quit on 'q'
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+            # Trigger conversation via distance sensor if camera is offline and distance is close
+            if not camera_online and distance is not None and distance < 100:
+                last_person_seen_time = time.time()
+                with conversation_active_lock:
+                    if not is_conversing:
+                        is_conversing = True
+                        speak("Hello! I notice you are near. How can I help you today?")
+                        threading.Thread(target=conversation_worker, daemon=True).start()
 
-except KeyboardInterrupt:
-    pass
-finally:
-    # Cleanup
-    if cap is not None:
-        cap.release()
-    cv2.destroyAllWindows()
-    GPIO.cleanup()
-    tts_engine.stop()
-    print("Assistant stopped.")
+            # Evaluate obstacles from sensor and camera
+            sensor_obstacle_detected = (distance is not None and distance < OBSTACLE_DIST_THRESH)
+            
+            # Camera obstacle: any object in front that is large/close
+            # e.g., center object with area_ratio > 0.08, or side objects with area_ratio > 0.15
+            camera_obstacles = [
+                obj for obj in current_detected_objects 
+                if (obj['position'] == 'center' and obj['area_ratio'] > 0.08) or 
+                   (obj['position'] != 'center' and obj['area_ratio'] > 0.15)
+            ]
+            camera_obstacles.sort(key=lambda x: x['area_ratio'], reverse=True)
+            camera_obstacle_detected = len(camera_obstacles) > 0
+
+            # Trigger navigation guidance if either sensor or camera detects an obstacle
+            if sensor_obstacle_detected or camera_obstacle_detected:
+                # Determine instruction
+                # Prioritize yolo obstacles for specific naming
+                yolo_obstacles = [obj for obj in current_detected_objects if obj['area_ratio'] > 0.005]
+                yolo_obstacles.sort(key=lambda x: x['area_ratio'], reverse=True)
+
+                if yolo_obstacles:
+                    primary_obstacle = yolo_obstacles[0]
+                    label = primary_obstacle['label']
+                    pos = primary_obstacle['position']
+
+                    if pos == "center":
+                        if distance is not None and distance < 30:
+                            instruction = f"{label} right ahead. Go back."
+                        else:
+                            left_clear = not any(obj['position'] == 'left' for obj in yolo_obstacles)
+                            right_clear = not any(obj['position'] == 'right' for obj in yolo_obstacles)
+                            if left_clear:
+                                instruction = f"{label} in front. Go left."
+                            elif right_clear:
+                                instruction = f"{label} in front. Go right."
+                            else:
+                                instruction = f"{label} in front. Go back."
+                    elif pos == "left":
+                        instruction = f"{label} on your left. Go right."
+                    else:  # right
+                        instruction = f"{label} on your right. Go left."
+                else:
+                    # Fallback if no YOLO objects are detected, but sensor triggered
+                    if distance is not None and distance < 30:
+                        instruction = f"Obstacle close, {distance} centimeters. Go back."
+                    else:
+                        dist_str = f"{distance} centimeters" if distance is not None else "ahead"
+                        instruction = f"Obstacle {dist_str}. Go left."
+
+                # Evaluate whether to speak
+                is_new_instruction = (instruction != last_nav_instruction)
+                time_elapsed = current_time - last_nav_time
+
+                # If we are conversing, suppress regular navigation instruction unless it's a critical close obstacle
+                should_speak_nav = True
+                if is_conversing:
+                    is_critical = (distance is not None and distance < 35)
+                    if not is_critical:
+                        should_speak_nav = False
+
+                if should_speak_nav:
+                    if is_new_instruction or (time_elapsed > NAV_INTERVAL):
+                        speak(instruction)
+                        last_nav_instruction = instruction
+                        last_nav_time = current_time
+                        last_obstacle_alert = True
+                    
+                    # If distance changed significantly while still close (sensor-based)
+                    elif (not is_new_instruction and distance is not None and last_distance is not None 
+                          and abs(distance - last_distance) > DIST_CHANGE_THRESH):
+                        speak(f"Distance now {distance} centimeters")
+            else:
+                # Reset alert when path becomes clear (no sensor obstacle and no camera obstacle)
+                if last_obstacle_alert:
+                    if not is_conversing:
+                        speak("Path is clear")
+                    last_nav_instruction = ""
+                last_obstacle_alert = False
+
+            # ---- OCR Text Reading (throttled & filtered) ----
+            # Disable OCR processing while conversing to save CPU
+            if not is_conversing and camera_online and (frame_count % OCR_EVERY_N_FRAMES == 0):
+                try:
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    # Use Tesseract with confidence data if possible
+                    try:
+                        data = pytesseract.image_to_data(gray, output_type=pytesseract.Output.DICT)
+                        # Concatenate only words with high confidence
+                        words = [word for word, conf in zip(data['text'], data['conf']) 
+                                 if conf > OCR_CONFIDENCE]
+                        text = ' '.join(words).strip()
+                    except Exception:
+                        # Fallback if confidence data not available
+                        text = pytesseract.image_to_string(gray).strip()
+
+                    if len(text) > OCR_MIN_LENGTH and text != ocr_last_text:
+                        if not is_conversing:
+                            speak("Text reads: " + text)
+                            ocr_last_text = text
+                except Exception as e:
+                    print(f"Error running OCR: {e}")
+
+            # ---- Show preview (optional) ----
+            cv2.imshow("AI Blind Assistant", frame)
+
+            # Yield CPU control during conversation to prioritize SpeechRecognition
+            if is_conversing:
+                time.sleep(0.05)
+
+            # Quit on 'q'
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # Cleanup
+        if cap is not None:
+            cap.release()
+        cv2.destroyAllWindows()
+        GPIO.cleanup()
+        tts_engine.stop()
+        print("Assistant stopped.")
